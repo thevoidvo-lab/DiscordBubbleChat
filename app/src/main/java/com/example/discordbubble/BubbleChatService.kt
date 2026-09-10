@@ -40,6 +40,7 @@ class BubbleChatService : Service() {
         const val CHANNEL_ID = "bubble_chat_service"
         const val NOTIF_ID = 1
         const val POLL_INTERVAL = 3000L
+        const val MAX_HISTORY = 10
     }
 
     override fun onCreate() {
@@ -219,17 +220,10 @@ class BubbleChatService : Service() {
 
     private fun appendMessageToPanel(author: String, content: String) {
         messageHistory.add(author to content)
-        val container = panelView?.findViewById<LinearLayout>(R.id.chatContainer) ?: return
-        val scroll = panelView?.findViewById<ScrollView>(R.id.chatScroll)
-
-        val tv = TextView(this)
-        tv.text = "$author: $content"
-        tv.setTextColor(resources.getColor(R.color.white, theme))
-        tv.textSize = 13f
-        tv.setPadding(4, 6, 4, 6)
-        container.addView(tv)
-
-        scroll?.post { scroll.fullScroll(View.FOCUS_DOWN) }
+        while (messageHistory.size > MAX_HISTORY) {
+            messageHistory.removeAt(0)
+        }
+        renderHistory()
     }
 
     private fun sendMessageToDiscord(content: String) {
@@ -293,7 +287,12 @@ class BubbleChatService : Service() {
                             if (isPanelOpen) {
                                 newOnes.forEach { (a, c) -> appendMessageToPanel(a, c) }
                             } else {
-                                newOnes.forEach { (a, c) -> messageHistory.add(a to c) }
+                                newOnes.forEach { (a, c) ->
+                                    messageHistory.add(a to c)
+                                    while (messageHistory.size > MAX_HISTORY) {
+                                        messageHistory.removeAt(0)
+                                    }
+                                }
                                 unreadCount += newOnes.size
                                 updateBadge()
                             }
