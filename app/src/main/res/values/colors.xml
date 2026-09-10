@@ -1,0 +1,7 @@
+<resources>
+    <color name="bubble_bg">#FF5865F2</color>
+    <color name="panel_bg">#F0313338</color>
+    <color name="input_bg">#FF3D3F46</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="text_muted">#FFB5BAC1</color>
+</resources>
