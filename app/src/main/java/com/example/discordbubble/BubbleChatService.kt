@@ -29,6 +29,7 @@ class BubbleChatService : Service() {
     private var channelId = ""
     private var unreadCount = 0
     private val lastIds = mutableSetOf<String>()
+    private val messageHistory = mutableListOf<Pair<String, String>>()
 
     private val pollHandler = Handler(Looper.getMainLooper())
     private var isPolling = false
@@ -163,6 +164,8 @@ class BubbleChatService : Service() {
         unreadCount = 0
         updateBadge()
 
+        renderHistory()
+
         panelView?.findViewById<ImageView>(R.id.btnClosePanel)?.setOnClickListener {
             closePanel()
         }
@@ -177,6 +180,21 @@ class BubbleChatService : Service() {
         }
 
         fetchMessages()
+    }
+
+    private fun renderHistory() {
+        val container = panelView?.findViewById<LinearLayout>(R.id.chatContainer) ?: return
+        val scroll = panelView?.findViewById<ScrollView>(R.id.chatScroll)
+        container.removeAllViews()
+        messageHistory.forEach { (a, c) ->
+            val tv = TextView(this)
+            tv.text = "$a: $c"
+            tv.setTextColor(resources.getColor(R.color.white, theme))
+            tv.textSize = 13f
+            tv.setPadding(4, 6, 4, 6)
+            container.addView(tv)
+        }
+        scroll?.post { scroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     private fun closePanel() {
@@ -200,6 +218,7 @@ class BubbleChatService : Service() {
     }
 
     private fun appendMessageToPanel(author: String, content: String) {
+        messageHistory.add(author to content)
         val container = panelView?.findViewById<LinearLayout>(R.id.chatContainer) ?: return
         val scroll = panelView?.findViewById<ScrollView>(R.id.chatScroll)
 
@@ -265,9 +284,8 @@ class BubbleChatService : Service() {
                         if (id in lastIds) continue
                         lastIds.add(id)
                         val author = m.getJSONObject("author").optString("username", "unknown")
-                        val isBot = m.getJSONObject("author").optBoolean("bot", false)
                         val content = m.optString("content", "")
-                        if (isBot || content.isEmpty()) continue
+                        if (content.isEmpty()) continue
                         newOnes.add(author to content)
                     }
                     if (newOnes.isNotEmpty()) {
@@ -275,6 +293,7 @@ class BubbleChatService : Service() {
                             if (isPanelOpen) {
                                 newOnes.forEach { (a, c) -> appendMessageToPanel(a, c) }
                             } else {
+                                newOnes.forEach { (a, c) -> messageHistory.add(a to c) }
                                 unreadCount += newOnes.size
                                 updateBadge()
                             }
