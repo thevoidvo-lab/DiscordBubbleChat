@@ -13,6 +13,7 @@ import androidx.core.app.NotificationCompat
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -24,23 +25,20 @@ class BubbleChatService : Service() {
     private var isPanelOpen = false
 
     private lateinit var client: OkHttpClient
-    private var webSocket: WebSocket? = null
-    private var heartbeatHandler: Handler? = null
-    private var heartbeatInterval: Long = 0
-    private var sequence: Int? = null
-
     private var token = ""
     private var channelId = ""
     private var unreadCount = 0
+    private val lastIds = mutableSetOf<String>()
+
+    private val pollHandler = Handler(Looper.getMainLooper())
+    private var isPolling = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
         const val CHANNEL_ID = "bubble_chat_service"
         const val NOTIF_ID = 1
-        const val GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
-        // GUILD_MESSAGES (1<<9) + MESSAGE_CONTENT (1<<15)
-        const val INTENTS = (1 shl 9) or (1 shl 15)
+        const val POLL_INTERVAL = 3000L
     }
 
     override fun onCreate() {
@@ -57,12 +55,10 @@ class BubbleChatService : Service() {
 
         startForegroundNotification()
         if (bubbleView == null) showBubble()
-        connectGateway()
+        if (!isPolling) startPolling()
 
         return START_STICKY
     }
-
-    // ---------- Foreground notification ----------
 
     private fun startForegroundNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -81,8 +77,6 @@ class BubbleChatService : Service() {
 
         startForeground(NOTIF_ID, notification)
     }
-
-    // ---------- Bubble UI ----------
 
     private fun showBubble() {
         val inflater = LayoutInflater.from(this)
@@ -141,11 +135,7 @@ class BubbleChatService : Service() {
     }
 
     private fun toggleChatPanel(bubbleParams: WindowManager.LayoutParams) {
-        if (isPanelOpen) {
-            closePanel()
-        } else {
-            openPanel(bubbleParams)
-        }
+        if (isPanelOpen) closePanel() else openPanel(bubbleParams)
     }
 
     private fun openPanel(bubbleParams: WindowManager.LayoutParams) {
@@ -185,6 +175,8 @@ class BubbleChatService : Service() {
                 et?.setText("")
             }
         }
+
+        fetchMessages()
     }
 
     private fun closePanel() {
@@ -207,8 +199,6 @@ class BubbleChatService : Service() {
         }
     }
 
-    // ---------- Chat rendering ----------
-
     private fun appendMessageToPanel(author: String, content: String) {
         val container = panelView?.findViewById<LinearLayout>(R.id.chatContainer) ?: return
         val scroll = panelView?.findViewById<ScrollView>(R.id.chatScroll)
@@ -223,8 +213,6 @@ class BubbleChatService : Service() {
         scroll?.post { scroll.fullScroll(View.FOCUS_DOWN) }
     }
 
-    // ---------- Discord REST: send message ----------
-
     private fun sendMessageToDiscord(content: String) {
         val body = JSONObject().put("content", content).toString()
             .toRequestBody("application/json".toMediaType())
@@ -237,122 +225,72 @@ class BubbleChatService : Service() {
             .build()
 
         client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: java.io.IOException) {
-                // gagal kirim, bisa ditambah retry/toast kalau perlu
-            }
+            override fun onFailure(call: Call, e: java.io.IOException) {}
             override fun onResponse(call: Call, response: Response) {
                 response.close()
             }
         })
     }
 
-    // ---------- Discord Gateway: receive messages ----------
-
-    private fun connectGateway() {
-        val request = Request.Builder().url(GATEWAY_URL).build()
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
-
-            override fun onMessage(ws: WebSocket, text: String) {
-                handleGatewayPayload(text)
+    private fun startPolling() {
+        isPolling = true
+        val runnable = object : Runnable {
+            override fun run() {
+                fetchMessages()
+                pollHandler.postDelayed(this, POLL_INTERVAL)
             }
-
-            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                stopHeartbeat()
-                // coba reconnect setelah 5 detik
-                mainHandler.postDelayed({ connectGateway() }, 5000)
-            }
-
-            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                stopHeartbeat()
-                mainHandler.postDelayed({ connectGateway() }, 5000)
-            }
-        })
+        }
+        pollHandler.post(runnable)
     }
 
-    private fun handleGatewayPayload(raw: String) {
-        val json = JSONObject(raw)
-        val op = json.getInt("op")
+    private fun fetchMessages() {
+        val request = Request.Builder()
+            .url("https://discord.com/api/v10/channels/$channelId/messages?limit=15")
+            .addHeader("Authorization", "Bot $token")
+            .get()
+            .build()
 
-        if (!json.isNull("s")) sequence = json.optInt("s")
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: java.io.IOException) {}
 
-        when (op) {
-            10 -> { // Hello
-                val data = json.getJSONObject("d")
-                heartbeatInterval = data.getLong("heartbeat_interval")
-                startHeartbeat()
-                identify()
-            }
-            0 -> { // Dispatch
-                val type = json.optString("t")
-                if (type == "MESSAGE_CREATE") {
-                    val d = json.getJSONObject("d")
-                    val msgChannelId = d.optString("channel_id")
-                    if (msgChannelId == channelId) {
-                        val author = d.getJSONObject("author").optString("username", "unknown")
-                        val content = d.optString("content", "")
-                        val isBot = d.getJSONObject("author").optBoolean("bot", false)
-                        if (!isBot && content.isNotEmpty()) {
+            override fun onResponse(call: Call, response: Response) {
+                val bodyStr = response.body?.string() ?: return
+                response.close()
+                try {
+                    val arr = JSONArray(bodyStr)
+                    val newOnes = mutableListOf<Pair<String, String>>()
+                    for (i in arr.length() - 1 downTo 0) {
+                        val m = arr.getJSONObject(i)
+                        val id = m.getString("id")
+                        if (id in lastIds) continue
+                        lastIds.add(id)
+                        val author = m.getJSONObject("author").optString("username", "unknown")
+                        val isBot = m.getJSONObject("author").optBoolean("bot", false)
+                        val content = m.optString("content", "")
+                        if (isBot || content.isEmpty()) continue
+                        newOnes.add(author to content)
+                    }
+                    if (newOnes.isNotEmpty()) {
+                        mainHandler.post {
                             if (isPanelOpen) {
-                                mainHandler.post { appendMessageToPanel(author, content) }
+                                newOnes.forEach { (a, c) -> appendMessageToPanel(a, c) }
                             } else {
-                                unreadCount++
+                                unreadCount += newOnes.size
                                 updateBadge()
                             }
                         }
                     }
+                } catch (e: Exception) {
+                    e.printStackTrace()
                 }
             }
-            9 -> { // Invalid session
-                mainHandler.postDelayed({ identify() }, 3000)
-            }
-            7 -> { // Reconnect requested
-                webSocket?.close(1000, "reconnect")
-                connectGateway()
-            }
-        }
+        })
     }
-
-    private fun identify() {
-        val identify = JSONObject()
-        identify.put("op", 2)
-        val d = JSONObject()
-        d.put("token", token)
-        d.put("intents", INTENTS)
-        val props = JSONObject()
-        props.put("os", "android")
-        props.put("browser", "bubblechat")
-        props.put("device", "bubblechat")
-        d.put("properties", props)
-        identify.put("d", d)
-        webSocket?.send(identify.toString())
-    }
-
-    private fun startHeartbeat() {
-        stopHeartbeat()
-        heartbeatHandler = Handler(Looper.getMainLooper())
-        val runnable = object : Runnable {
-            override fun run() {
-                val hb = JSONObject()
-                hb.put("op", 1)
-                hb.put("d", sequence)
-                webSocket?.send(hb.toString())
-                heartbeatHandler?.postDelayed(this, heartbeatInterval)
-            }
-        }
-        heartbeatHandler?.postDelayed(runnable, heartbeatInterval)
-    }
-
-    private fun stopHeartbeat() {
-        heartbeatHandler?.removeCallbacksAndMessages(null)
-        heartbeatHandler = null
-    }
-
-    // ---------- Cleanup ----------
 
     override fun onDestroy() {
         super.onDestroy()
-        webSocket?.close(1000, "service stopped")
-        stopHeartbeat()
+        pollHandler.removeCallbacksAndMessages(null)
+        isPolling = false
         bubbleView?.let { try { windowManager.removeView(it) } catch (e: Exception) {} }
         panelView?.let { try { windowManager.removeView(it) } catch (e: Exception) {} }
     }
